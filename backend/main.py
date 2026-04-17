@@ -16,8 +16,12 @@ from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pathlib import Path
+
+# 信道干扰分析
+from channel_analyzer import ChannelAnalyzer
+import channel_api
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -35,6 +39,7 @@ class AppState:
         self.max_history = 360
         self._mock_collector = None
         self._mock_interval = 10
+        self.channel_analyzer = ChannelAnalyzer()
 
 state = AppState()
 
@@ -73,6 +78,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Zigbee Topology Tool", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# 注册信道分析路由 (analyzer 在 main() 中注入)
+app.include_router(channel_api.router)
 
 
 # ── REST API ──
@@ -147,12 +155,16 @@ async def css(filename: str):
     return FileResponse(FRONTEND_DIR / "css" / filename)
 
 
+@app.get("/channel")
+async def channel_page():
+    return FileResponse(FRONTEND_DIR / "channel.html")
+
+
 @app.get("/src/{filename}")
 async def src(filename: str):
     fpath = FRONTEND_DIR / "src" / filename
     if fpath.exists():
         return FileResponse(fpath)
-    # D3 fallback → CDN
     return FileResponse(fpath)
 
 
@@ -172,6 +184,9 @@ def main():
         from mock_collector import MockCollector
         state._mock_collector = MockCollector(num_routers=8, num_seds=12)
         state._mock_interval = args.interval
+
+    # 注入信道分析器到 API 模块
+    channel_api.analyzer = state.channel_analyzer
 
     uvicorn.run(app, host=args.host, port=8000)
 
