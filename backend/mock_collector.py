@@ -51,7 +51,6 @@ class MockCollector:
             nwk = f"0x{i:04X}"
             router_nwks.append(nwk)
             lqi = random.randint(150, 255)
-            # 偶尔模拟弱链路
             if random.random() < 0.1:
                 lqi = random.randint(30, 80)
                 alerts.append({
@@ -76,7 +75,7 @@ class MockCollector:
                 "lqi": lqi,
             })
 
-        # Router-to-Router links (mesh)
+        # Router-to-Router links (mesh) - 模拟 Router 上报的邻居关系
         for i, nwk in enumerate(router_nwks):
             if i + 1 < len(router_nwks):
                 peer_lqi = random.randint(100, 240)
@@ -84,17 +83,21 @@ class MockCollector:
                     "source": nwk,
                     "target": router_nwks[i + 1],
                     "lqi": peer_lqi,
+                    "source_type": "router_report",
+                })
+            if i + 2 < len(router_nwks) and random.random() < 0.5:
+                links.append({
+                    "source": nwk,
+                    "target": router_nwks[i + 2],
+                    "lqi": random.randint(80, 200),
+                    "source_type": "router_report",
                 })
 
         # SEDs
-        sed_nwks = []
         for i in range(self.num_seds):
             nwk = f"0x{self.num_routers + 1 + i:04X}"
-            sed_nwks.append(nwk)
             parent = random.choice(router_nwks)
             lqi = random.randint(80, 220)
-
-            # 偶尔模拟 SED 孤儿
             if random.random() < 0.05:
                 alerts.append({
                     "type": "orphan_sed",
@@ -124,6 +127,7 @@ class MockCollector:
             "nodes": nodes,
             "links": links,
             "alerts": alerts,
+            "router_reports": self.num_routers,
         }
 
     async def run(self, interval=10):

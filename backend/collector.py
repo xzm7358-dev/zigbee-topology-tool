@@ -15,6 +15,8 @@ import logging
 from datetime import datetime
 from typing import Optional, Callable, Awaitable
 
+from router_report import RouterReportAggregator
+
 logger = logging.getLogger(__name__)
 
 
@@ -29,6 +31,7 @@ class ZigbeeTopologyCollector:
         self.coordinator_nwk: int = 0x0000
         self._callbacks = []
         self._last_snapshot_hash = None
+        self.router_aggregator = RouterReportAggregator()  # Router 上报数据聚合器
 
     def on_update(self, callback):
         """注册数据更新回调"""
@@ -78,7 +81,24 @@ class ZigbeeTopologyCollector:
             logger.warning(f"getNetworkParameters 异常: {e}")
 
         logger.info(f"Coordinator: IEEE={self.coordinator_ieee}, NWK=0x{self.coordinator_nwk:04X}")
+
+        # 注册 EZSP 接收回调，捕获 Router 上报的 ZCL 数据
+        self.ezsp.add_callback(self._ezsp_callback)
+
         return self.coordinator_ieee, self.coordinator_nwk
+
+    def _ezsp_callback(self, event_name, data):
+        """EZSP 事件回调，捕获来自 Router 的 ZCL 上报"""
+        if event_name == "incoming_message" or event_name == "message_handler":
+            try:
+                # 检查是否是自定义 cluster 0xFC00
+                if hasattr(data, 'apsFrame') and data.apsFrame.clusterId == 0xFC00:
+                    source_nwk = data.sender if hasattr(data, 'sender') else None
+                    if source_nwk and hasattr(data, 'message'):
+                        payload = bytes(data.message) if not isinstance(data.message, bytes) else data.message
+                        self.router_aggregator.process_raw_frame(source_nwk, payload)
+            except Exception as e:
+                logger.debug(f"EZSP 回调处理异常: {e}")
 
     # ── 邻居表 ──────────────────────────────────────
     async def read_neighbor_table(self):
@@ -366,10 +386,15 @@ class ZigbeeTopologyCollector:
         alerts = self.analyze(neighbors, routes, children)
         snapshot = self.build_snapshot(neighbors, routes, children, alerts)
 
+        # 合并 Router 上报数据 (如果有)
+        if self.router_aggregator.router_reports:
+            snapshot = self.router_aggregator.merge_to_snapshot(snapshot)
+
         logger.info(
             f"采集: {len(snapshot['nodes'])} 节点, "
             f"{len(snapshot['links'])} 连线, "
-            f"{len(alerts)} 告警"
+            f"{len(alerts)} 告警, "
+            f"{len(self.router_aggregator.router_reports)} Router上报"
         )
         return snapshot
 
