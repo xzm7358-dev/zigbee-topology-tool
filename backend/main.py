@@ -19,9 +19,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pathlib import Path
 
-# 信道干扰分析
+# 模块
 from channel_analyzer import ChannelAnalyzer
+from history_store import HistoryStore
 import channel_api
+import history_api
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -40,16 +42,31 @@ class AppState:
         self._mock_collector = None
         self._mock_interval = 10
         self.channel_analyzer = ChannelAnalyzer()
+        self.history_store = HistoryStore(str(Path(__file__).parent / "topology_history.db"))
+        self._history_save_counter = 0
+        self._history_save_every = 6  # 每6个快照(60s)存一次到SQLite
 
 state = AppState()
 
 
 async def on_snapshot(snapshot: dict):
     state.latest_snapshot = snapshot
+
+    # 内存历史 (WebSocket 推送用)
     state.history.append(snapshot)
     if len(state.history) > state.max_history:
         state.history = state.history[-state.max_history:]
 
+    # 持久化到 SQLite (降低频率，避免IO过频)
+    state._history_save_counter += 1
+    if state._history_save_counter >= state._history_save_every:
+        state._history_save_counter = 0
+        try:
+            state.history_store.save_topology_snapshot(snapshot)
+        except Exception as e:
+            logger.error(f"保存历史快照失败: {e}")
+
+    # WebSocket 推送
     data = json.dumps(snapshot, ensure_ascii=False)
     disconnected = []
     for ws in state.ws_clients:
@@ -64,7 +81,6 @@ async def on_snapshot(snapshot: dict):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("服务启动")
-    # 如果已配置 mock，在此启动
     if state._mock_collector:
         state.collector = state._mock_collector
         state.collector.on_update(on_snapshot)
@@ -79,8 +95,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Zigbee Topology Tool", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# 注册信道分析路由 (analyzer 在 main() 中注入)
+# 注册路由
 app.include_router(channel_api.router)
+app.include_router(history_api.router)
 
 
 # ── REST API ──
@@ -88,13 +105,11 @@ app.include_router(channel_api.router)
 async def connect_coordinator(port: str = "/dev/ttyUSB0", baudrate: int = 115200):
     if state.collect_task and not state.collect_task.done():
         return {"status": "already_running"}
-
     try:
         from collector import ZigbeeTopologyCollector
         state.collector = ZigbeeTopologyCollector(port, baudrate)
     except Exception as e:
         return {"status": "error", "message": str(e)}
-
     state.collector.on_update(on_snapshot)
     state.collect_task = asyncio.create_task(state.collector.run(interval=10))
     return {"status": "connecting", "port": port}
@@ -120,10 +135,13 @@ async def get_history(count: int = 20):
 
 @app.get("/api/status")
 async def get_status():
+    db_range = state.history_store.get_time_range()
     return {
         "connected": state.collector is not None and state.collect_task and not state.collect_task.done(),
         "clients": len(state.ws_clients),
-        "history_size": len(state.history),
+        "memory_history": len(state.history),
+        "db_topology_count": db_range.get("topology", {}).get("count", 0),
+        "db_events_count": db_range.get("events", {}).get("count", 0),
     }
 
 
@@ -160,6 +178,11 @@ async def channel_page():
     return FileResponse(FRONTEND_DIR / "channel.html")
 
 
+@app.get("/replay")
+async def replay_page():
+    return FileResponse(FRONTEND_DIR / "replay.html")
+
+
 @app.get("/src/{filename}")
 async def src(filename: str):
     fpath = FRONTEND_DIR / "src" / filename
@@ -185,8 +208,10 @@ def main():
         state._mock_collector = MockCollector(num_routers=8, num_seds=12)
         state._mock_interval = args.interval
 
-    # 注入信道分析器到 API 模块
+    # 注入共享实例到 API 模块
     channel_api.analyzer = state.channel_analyzer
+    history_api.history_store = state.history_store
+    history_api.channel_analyzer = state.channel_analyzer
 
     uvicorn.run(app, host=args.host, port=8000)
 

@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Zigbee 时序回放</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--card:#1c2333;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--orange:#db6d28;--red:#f85149}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);height:100vh;overflow:hidden}
+
+.toolbar{display:flex;align-items:center;justify-content:space-between;padding:10px 20px;background:var(--panel);border-bottom:1px solid var(--border);height:52px}
+.toolbar h1{font-size:17px;font-weight:600}
+.toolbar-actions{display:flex;gap:8px;align-items:center}
+button{padding:5px 12px;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text);cursor:pointer;font-size:13px;display:flex;align-items:center;gap:4px}
+button:hover{background:var(--border)}
+button.active{background:var(--accent);border-color:var(--accent);color:#fff}
+select{padding:5px 8px;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text);font-size:13px}
+
+.main{display:flex;flex-direction:column;height:calc(100vh - 52px)}
+
+/* ── 内容区 ── */
+.content{flex:1;display:flex;overflow:hidden}
+.topo-area{flex:1;position:relative;border-right:1px solid var(--border)}
+.topo-area svg{width:100%;height:100%}
+
+.side-panel{width:300px;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:12px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px}
+.card h3{font-size:14px;margin-bottom:10px;font-weight:600}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.stat{text-align:center;padding:6px;background:var(--panel);border-radius:6px}
+.stat b{display:block;font-size:20px}
+.stat small{font-size:11px;color:var(--muted)}
+
+.event-item{padding:6px 8px;margin-bottom:4px;border-radius:4px;font-size:11px;border-left:2px solid}
+.event-item.critical{border-color:var(--red);background:rgba(248,81,73,.08);color:var(--red)}
+.event-item.warning{border-color:var(--yellow);background:rgba(210,153,34,.08);color:var(--yellow)}
+.event-time{font-size:10px;color:var(--muted)}
+
+/* ── 时间轴面板 ── */
+.timeline-panel{background:var(--panel);border-top:1px solid var(--border);padding:12px 20px 16px}
+
+.timeline-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.timeline-header .time-display{font-size:18px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:.5px}
+.timeline-header .date-display{font-size:13px;color:var(--muted)}
+
+.timeline-controls{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.speed-label{font-size:12px;color:var(--muted);min-width:30px;text-align:center}
+
+/* 滑块 */
+.timeline-slider{position:relative;height:50px;margin-bottom:6px}
+.slider-track{position:absolute;top:24px;left:0;right:0;height:4px;background:var(--border);border-radius:2px;cursor:pointer}
+.slider-fill{position:absolute;top:24px;left:0;height:4px;background:var(--accent);border-radius:2px;pointer-events:none}
+.slider-thumb{position:absolute;top:17px;width:18px;height:18px;background:var(--accent);border:3px solid var(--bg);border-radius:50%;cursor:grab;transform:translateX(-50%);z-index:2;transition:box-shadow .15s}
+.slider-thumb:hover,.slider-thumb.dragging{box-shadow:0 0 0 4px rgba(88,166,255,.3)}
+
+/* 事件标记 */
+.event-mark{position:absolute;top:12px;width:4px;height:10px;border-radius:1px;transform:translateX(-50%);cursor:pointer;opacity:.7}
+.event-mark:hover{opacity:1}
+.event-mark.critical{background:var(--red)}
+.event-mark.warning{background:var(--yellow)}
+
+/* 时间刻度 */
+.tick-marks{position:relative;height:16px;margin-top:2px}
+.tick{position:absolute;transform:translateX(-50%);font-size:9px;color:var(--muted)}
+
+/* 节点图例 */
+.legend-bar{display:flex;gap:12px;font-size:11px;color:var(--muted);align-items:center}
+.legend-bar span{display:flex;align-items:center;gap:3px}
+.legend-bar i{width:7px;height:7px;border-radius:50%;display:inline-block}
+
+.node-label{font-size:10px;fill:var(--text);pointer-events:none;text-anchor:middle}
+.link{fill:none;stroke-linecap:round}
+
+.no-data{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;color:var(--muted)}
+.no-data h2{font-size:16px;margin-bottom:6px}
+.no-data p{font-size:13px}
+</style>
+</head>
+<body>
+<div class="toolbar">
+  <h1>⏪ Zigbee 时序回放</h1>
+  <div class="toolbar-actions">
+    <select id="range-select" onchange="changeRange()">
+      <option value="1h">最近1小时</option>
+      <option value="6h">最近6小时</option>
+      <option value="24h" selected>最近24小时</option>
+      <option value="7d">最近7天</option>
+    </select>
+    <button onclick="goLive()">🔴 实时</button>
+  </div>
+</div>
+
+<div class="main">
+  <div class="content">
+    <div class="topo-area">
+      <svg id="topo-svg"></svg>
+      <div class="no-data" id="no-data">
+        <h2>等待数据...</h2>
+        <p>需要至少2个快照才能回放</p>
+      </div>
+      <!-- 图例 -->
+      <div style="position:absolute;top:8px;left:12px" class="legend-bar">
+        <span><i style="background:var(--green)"></i>Coordinator</span>
+        <span><i style="background:var(--blue)"></i>Router</span>
+        <span><i style="background:var(--yellow)"></i>SED</span>
+        <span><i style="background:var(--red)"></i>异常</span>
+        <span style="margin-left:8px">LQI:</span>
+        <span><i style="background:var(--green)"></i>&gt;200</span>
+        <span><i style="background:var(--yellow)"></i>&gt;100</span>
+        <span><i style="background:var(--orange)"></i>&gt;50</span>
+        <span><i style="background:var(--red)"></i>&lt;50</span>
+      </div>
+    </div>
+
+    <div class="side-panel">
+      <div class="card">
+        <h3>📊 当前快照</h3>
+        <div class="stats">
+          <div class="stat"><b id="s-n">0</b><small>节点</small></div>
+          <div class="stat"><b id="s-l">0</b><small>连线</small></div>
+          <div class="stat"><b id="s-a">0</b><small>告警</small></div>
+          <div class="stat"><b id="s-r">0</b><small>Router</small></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>📋 事件日志</h3>
+        <div id="events-list" style="max-height:300px;overflow-y:auto">
+          <p style="color:var(--muted);font-size:12px;text-align:center;padding:16px">拖动时间轴查看事件</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── 时间轴 ── -->
+  <div class="timeline-panel">
+    <div class="timeline-header">
+      <div>
+        <div class="time-display" id="current-time">--:--:--</div>
+        <div class="date-display" id="current-date">----/--/--</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="font-size:12px;color:var(--muted)" id="frame-info">-- / --</span>
+      </div>
+    </div>
+
+    <div class="timeline-controls">
+      <button onclick="skipBack()">⏮</button>
+      <button onclick="stepBack()">◀</button>
+      <button id="play-btn" onclick="togglePlay()">▶ 播放</button>
+      <button onclick="stepForward()">▶</button>
+      <button onclick="skipForward()">⏭</button>
+      <span class="speed-label" id="speed-label">1x</span>
+      <button onclick="changeSpeed()" id="speed-btn">速度</button>
+    </div>
+
+    <div class="timeline-slider" id="slider-container">
+      <div class="slider-track" id="slider-track"></div>
+      <div class="slider-fill" id="slider-fill"></div>
+      <div class="slider-thumb" id="slider-thumb"></div>
+      <!-- 事件标记会动态插入 -->
+    </div>
+
+    <div class="tick-marks" id="tick-marks"></div>
+  </div>
+</div>
+
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script>
+const API = `http://${location.host}/api/history`;
+
+// ── 状态 ──
+let snapshots = [];
+let currentIndex = 0;
+let isPlaying = false;
+let playTimer = null;
+let playSpeed = 1; // 1x, 2x, 4x, 8x
+const speeds = [1, 2, 4, 8, 16];
+let speedIdx = 0;
+let sim = null;
+let isDragging = false;
+
+// ── 颜色 ──
+function nColor(d){return d.status==="offline"?"var(--red)":d.type==="Coordinator"?"var(--green)":d.type==="Router"?"var(--blue)":d.type==="Sleepy_End_Device"?"var(--yellow)":"var(--muted)"}
+function nR(d){return d.type==="Coordinator"?16:d.type==="Router"?10:7}
+function lColor(l){return l==null?"#555":l>=200?"#3fb950":l>=100?"#d29922":l>=50?"#db6d28":"#f85149"}
+function lW(l){return l==null?1:Math.max(1,l/80)}
+
+// ── 加载数据 ──
+async function loadHistory() {
+  const range = document.getElementById('range-select').value;
+  const now = new Date();
+  let start;
+
+  switch(range) {
+    case '1h': start = new Date(now - 3600000); break;
+    case '6h': start = new Date(now - 21600000); break;
+    case '24h': start = new Date(now - 86400000); break;
+    case '7d': start = new Date(now - 604800000); break;
+  }
+
+  const startStr = start.toISOString();
+  const endStr = now.toISOString();
+
+  // 根据范围调整 step
+  let step = 1;
+  if (range === '6h') step = 3;
+  if (range === '24h') step = 6;
+  if (range === '7d') step = 60;
+
+  try {
+    const resp = await fetch(`${API}/topology?start=${encodeURIComponent(startStr)}&end=${encodeURIComponent(endStr)}&step=${step}`);
+    const data = await resp.json();
+    snapshots = data.snapshots || [];
+
+    if (snapshots.length < 2) {
+      document.getElementById('no-data').style.display = '';
+      return;
+    }
+
+    document.getElementById('no-data').style.display = 'none';
+    currentIndex = 0;
+    renderFrame(0);
+    buildTimeline();
+    loadEvents(startStr, endStr);
+  } catch(e) {
+    console.error('加载历史失败', e);
+    document.getElementById('no-data').innerHTML = '<h2>加载失败</h2><p>请确认后端服务运行中</p>';
+  }
+}
+
+// ── 渲染拓扑 ──
+function renderFrame(idx) {
+  if (idx < 0 || idx >= snapshots.length) return;
+  currentIndex = idx;
+  const data = snapshots[idx];
+
+  // 更新时间显示
+  const ts = data.timestamp || '';
+  const datePart = ts.substring(0, 10);
+  const timePart = ts.substring(11, 19);
+  document.getElementById('current-time').textContent = timePart;
+  document.getElementById('current-date').textContent = datePart;
+  document.getElementById('frame-info').textContent = `${idx + 1} / ${snapshots.length}`;
+
+  // 统计
+  document.getElementById('s-n').textContent = (data.nodes||[]).length;
+  document.getElementById('s-l').textContent = (data.links||[]).length;
+  document.getElementById('s-a').textContent = (data.alerts||[]).length;
+  document.getElementById('s-r').textContent = (data.nodes||[]).filter(n=>n.type==='Router').length;
+
+  // D3 渲染
+  renderTopology(data);
+  updateSliderPosition();
+}
+
+function renderTopology(data) {
+  const svg = d3.select('#topo-svg');
+  const W = svg.node().clientWidth;
+  const H = svg.node().clientHeight;
+  svg.attr('viewBox', [0, 0, W, H]);
+
+  let g = svg.select('.topo-g');
+  if (g.empty()) {
+    g = svg.append('g').attr('class', 'topo-g');
+    svg.call(d3.zoom().scaleExtent([.3, 5]).on('zoom', e => g.attr('transform', e.transform)));
+  }
+
+  const nodes = (data.nodes||[]).map(d => ({...d}));
+  const nMap = {}; nodes.forEach(n => nMap[n.nwk] = n);
+  const links = (data.links||[]).filter(l => nMap[l.source] && nMap[l.target])
+    .map(l => ({source: l.source, target: l.target, lqi: l.lqi}));
+
+  if (sim) sim.stop();
+  sim = d3.forceSimulation(nodes)
+    .force("link", d3.forceLink(links).id(d => d.nwk).distance(70))
+    .force("charge", d3.forceManyBody().strength(-180))
+    .force("center", d3.forceCenter(W/2, H/2))
+    .force("collision", d3.forceCollide().radius(d => nR(d) + 8));
+
+  const link = g.selectAll('.lg').data(links, d => d.source.nwk + '-' + d.target.nwk);
+  link.exit().remove();
+  const linkE = link.enter().append('g').attr('class', 'lg');
+  linkE.append('line').attr('class', 'link').attr('stroke', d => lColor(d.lqi)).attr('stroke-width', d => lW(d.lqi));
+  linkE.append('text').attr('font-size', '8px').attr('fill', '#8b949e').attr('text-anchor', 'middle').text(d => d.lqi != null ? d.lqi : '');
+  const linkA = linkE.merge(link);
+
+  const node = g.selectAll('.ng').data(nodes, d => d.nwk);
+  node.exit().remove();
+  const nodeE = node.enter().append('g').attr('class', 'ng');
+  nodeE.append('circle').attr('r', d => nR(d) + 3).attr('fill', d => nColor(d)).attr('opacity', .12);
+  nodeE.append('circle').attr('r', d => nR(d)).attr('fill', d => nColor(d)).attr('stroke', '#0d1117').attr('stroke-width', 2);
+  nodeE.append('text').attr('class', 'node-label').attr('dy', d => nR(d) + 13).text(d => d.nwk);
+  const nodeA = nodeE.merge(node);
+
+  sim.on('tick', () => {
+    linkA.select('line').attr('x1', d => d.source.x).attr('y1', d => d.source.y).attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+    linkA.select('text').attr('x', d => (d.source.x + d.target.x) / 2).attr('y', d => (d.source.y + d.target.y) / 2 - 4);
+    nodeA.attr('transform', d => `translate(${d.x},${d.y})`);
+  });
+}
+
+// ── 时间轴 ──
+function buildTimeline() {
+  if (!snapshots.length) return;
+  const container = document.getElementById('slider-container');
+  const width = container.clientWidth;
+
+  // 清除旧事件标记
+  container.querySelectorAll('.event-mark').forEach(e => e.remove());
+
+  // 刻度
+  const ticksEl = document.getElementById('tick-marks');
+  ticksEl.innerHTML = '';
+  const tickCount = Math.min(10, snapshots.length);
+  const tickStep = Math.floor(snapshots.length / tickCount);
+  for (let i = 0; i < snapshots.length; i += tickStep) {
+    const pct = (i / (snapshots.length - 1)) * 100;
+    const ts = snapshots[i].timestamp || '';
+    const label = ts.substring(11, 16);
+    ticksEl.innerHTML += `<span class="tick" style="left:${pct}%">${label}</span>`;
+  }
+
+  updateSliderPosition();
+}
+
+function updateSliderPosition() {
+  if (!snapshots.length) return;
+  const pct = (currentIndex / (snapshots.length - 1)) * 100;
+  document.getElementById('slider-thumb').style.left = pct + '%';
+  document.getElementById('slider-fill').style.width = pct + '%';
+}
+
+// 拖拽
+const thumb = document.getElementById('slider-thumb');
+const track = document.getElementById('slider-track');
+
+function sliderFromX(clientX) {
+  const rect = track.getBoundingClientRect();
+  const pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+  const idx = Math.round(pct * (snapshots.length - 1));
+  renderFrame(idx);
+}
+
+thumb.addEventListener('mousedown', e => { isDragging = true; thumb.classList.add('dragging'); e.preventDefault(); });
+track.addEventListener('click', e => sliderFromX(e.clientX));
+document.addEventListener('mousemove', e => { if (isDragging) sliderFromX(e.clientX); });
+document.addEventListener('mouseup', () => { isDragging = false; thumb.classList.remove('dragging'); });
+
+// Touch
+thumb.addEventListener('touchstart', e => { isDragging = true; thumb.classList.add('dragging'); e.preventDefault(); });
+document.addEventListener('touchmove', e => { if (isDragging) sliderFromX(e.touches[0].clientX); });
+document.addEventListener('touchend', () => { isDragging = false; thumb.classList.remove('dragging'); });
+
+// ── 播放控制 ──
+function togglePlay() {
+  if (isPlaying) {
+    stopPlay();
+  } else {
+    startPlay();
+  }
+}
+
+function startPlay() {
+  if (currentIndex >= snapshots.length - 1) currentIndex = 0;
+  isPlaying = true;
+  document.getElementById('play-btn').textContent = '⏸ 暂停';
+  document.getElementById('play-btn').classList.add('active');
+  scheduleNext();
+}
+
+function stopPlay() {
+  isPlaying = false;
+  clearTimeout(playTimer);
+  document.getElementById('play-btn').textContent = '▶ 播放';
+  document.getElementById('play-btn').classList.remove('active');
+}
+
+function scheduleNext() {
+  if (!isPlaying) return;
+  const delay = Math.max(50, 1000 / playSpeed);
+  playTimer = setTimeout(() => {
+    if (currentIndex < snapshots.length - 1) {
+      renderFrame(currentIndex + 1);
+      scheduleNext();
+    } else {
+      stopPlay();
+    }
+  }, delay);
+}
+
+function stepBack() {
+  stopPlay();
+  if (currentIndex > 0) renderFrame(currentIndex - 1);
+}
+
+function stepForward() {
+  stopPlay();
+  if (currentIndex < snapshots.length - 1) renderFrame(currentIndex + 1);
+}
+
+function skipBack() {
+  stopPlay();
+  renderFrame(0);
+}
+
+function skipForward() {
+  stopPlay();
+  renderFrame(snapshots.length - 1);
+}
+
+function changeSpeed() {
+  speedIdx = (speedIdx + 1) % speeds.length;
+  playSpeed = speeds[speedIdx];
+  document.getElementById('speed-label').textContent = playSpeed + 'x';
+}
+
+// ── 事件日志 ──
+async function loadEvents(start, end) {
+  try {
+    const resp = await fetch(`${API}/events?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&limit=50`);
+    const events = await resp.json();
+    renderEvents(events);
+    addEventMarkers(events);
+  } catch(e) {
+    console.error('加载事件失败', e);
+  }
+}
+
+function renderEvents(events) {
+  const el = document.getElementById('events-list');
+  if (!events.length) {
+    el.innerHTML = '<p style="color:var(--muted);font-size:12px;text-align:center;padding:16px">无事件</p>';
+    return;
+  }
+  el.innerHTML = events.slice(0, 30).map(e => `
+    <div class="event-item ${e.severity}">
+      <div class="event-time">${(e.timestamp||'').substring(11, 19)}</div>
+      ${e.message}
+    </div>
+  `).join('');
+}
+
+function addEventMarkers(events) {
+  if (!snapshots.length) return;
+  const container = document.getElementById('slider-container');
+  const firstTs = snapshots[0].timestamp;
+  const lastTs = snapshots[snapshots.length - 1].timestamp;
+  const firstMs = new Date(firstTs).getTime();
+  const lastMs = new Date(lastTs).getTime();
+  const range = lastMs - firstMs || 1;
+
+  events.forEach(ev => {
+    const evMs = new Date(ev.timestamp).getTime();
+    const pct = ((evMs - firstMs) / range) * 100;
+    if (pct >= 0 && pct <= 100) {
+      const mark = document.createElement('div');
+      mark.className = `event-mark ${ev.severity}`;
+      mark.style.left = pct + '%';
+      mark.title = ev.message;
+      container.appendChild(mark);
+    }
+  });
+}
+
+// ── 切换范围 ──
+function changeRange() {
+  stopPlay();
+  loadHistory();
+}
+
+// ── 实时模式 ──
+function goLive() {
+  window.location.href = '/';
+}
+
+// ── 键盘快捷键 ──
+document.addEventListener('keydown', e => {
+  if (e.key === ' ') { e.preventDefault(); togglePlay(); }
+  else if (e.key === 'ArrowLeft') stepBack();
+  else if (e.key === 'ArrowRight') stepForward();
+  else if (e.key === 'Home') skipBack();
+  else if (e.key === 'End') skipForward();
+});
+
+// ── 启动 ──
+loadHistory();
+</script>
+</body>
+</html>
