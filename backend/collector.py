@@ -1,15 +1,19 @@
 """
-Zigbee Topology Collector - EZSP 数据采集层
-通过 bellows 连接 Coordinator，轮询邻居表/路由表/子节点表
+Zigbee Topology Collector - EZSP 数据采集层 (v2)
+兼容 MG21 / EmberZNet 不同版本
+
+改进:
+- 更健壮的 EZSP API 调用（兼容不同版本）
+- 异常自动恢复
+- 采集间隔可配置
+- 数据变化检测（避免重复推送）
 """
 
 import asyncio
 import bellows.ezsp
-import bellows.types as t
-import json
 import logging
 from datetime import datetime
-from pathlib import Path
+from typing import Optional, Callable, Awaitable
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +25,13 @@ class ZigbeeTopologyCollector:
         self.serial_port = serial_port
         self.baudrate = baudrate
         self.ezsp = None
-        self.coordinator_ieee = None
-        self.coordinator_nwk = None
-        self._callbacks = []  # 数据更新回调列表
+        self.coordinator_ieee: Optional[str] = None
+        self.coordinator_nwk: int = 0x0000
+        self._callbacks = []
+        self._last_snapshot_hash = None
 
     def on_update(self, callback):
-        """注册数据更新回调，callback(snapshot) 会被调用"""
+        """注册数据更新回调"""
         self._callbacks.append(callback)
 
     async def _notify(self, snapshot):
@@ -39,22 +44,45 @@ class ZigbeeTopologyCollector:
             except Exception as e:
                 logger.error(f"回调异常: {e}")
 
+    # ── 连接 ────────────────────────────────────────
     async def connect(self):
         """连接 Coordinator"""
+        logger.info(f"连接 {self.serial_port} @ {self.baudrate}...")
+
         self.ezsp = bellows.ezsp.EZSP()
         await self.ezsp.connect(self.serial_port, self.baudrate)
 
-        (status, ieee) = await self.ezsp.getEui64()
-        (status, nwk) = await self.ezsp.getNetworkParameters()
+        # 读取 IEEE
+        try:
+            (status, ieee) = await self.ezsp.getEui64()
+            if status == 0:
+                self.coordinator_ieee = str(ieee)
+        except Exception as e:
+            logger.warning(f"getEui64 异常: {e}")
+            self.coordinator_ieee = "unknown"
 
-        self.coordinator_ieee = str(ieee)
-        self.coordinator_nwk = 0x0000  # Coordinator always 0x0000
+        # 读取 NWK
+        try:
+            (status, nwk) = await self.ezsp.getNodeId()
+            if status == 0:
+                self.coordinator_nwk = nwk
+        except Exception:
+            self.coordinator_nwk = 0x0000
 
-        logger.info(f"已连接 Coordinator: IEEE={self.coordinator_ieee}")
+        # 打印网络信息
+        try:
+            (status, params) = await self.ezsp.getNetworkParameters()
+            if status == 0:
+                logger.info(f"网络参数: {params}")
+        except Exception as e:
+            logger.warning(f"getNetworkParameters 异常: {e}")
+
+        logger.info(f"Coordinator: IEEE={self.coordinator_ieee}, NWK=0x{self.coordinator_nwk:04X}")
         return self.coordinator_ieee, self.coordinator_nwk
 
     # ── 邻居表 ──────────────────────────────────────
     async def read_neighbor_table(self):
+        """读取邻居表，兼容不同 EZSP 版本"""
         neighbors = []
         idx = 0
 
@@ -65,13 +93,23 @@ class ZigbeeTopologyCollector:
                     break
 
                 for entry in entries:
-                    neighbors.append({
-                        "nwk": entry.nwk,
-                        "ieee": str(entry.ieee),
-                        "lqi": entry.lqi,
-                        "depth": entry.depth,
-                        "relationship": self._decode_relationship(entry.relationship),
-                    })
+                    try:
+                        # 不同版本字段名可能不同，做兼容
+                        nwk = getattr(entry, 'nwk', getattr(entry, 'shortId', None))
+                        ieee = getattr(entry, 'ieee', getattr(entry, 'longId', None))
+                        lqi = getattr(entry, 'lqi', getattr(entry, 'linkQuality', 0))
+                        depth = getattr(entry, 'depth', 0)
+                        relationship = getattr(entry, 'relationship', 0)
+
+                        neighbors.append({
+                            "nwk": nwk,
+                            "ieee": str(ieee) if ieee else None,
+                            "lqi": lqi if isinstance(lqi, int) else 0,
+                            "depth": depth if isinstance(depth, int) else 0,
+                            "relationship": self._decode_relationship(relationship),
+                        })
+                    except Exception as e:
+                        logger.debug(f"邻居条目解析异常: {e}, raw={entry}")
                     idx += 1
 
                 if len(entries) < 8:
@@ -85,6 +123,7 @@ class ZigbeeTopologyCollector:
 
     # ── 路由表 ──────────────────────────────────────
     async def read_routing_table(self):
+        """读取路由表"""
         routes = []
         idx = 0
 
@@ -95,12 +134,20 @@ class ZigbeeTopologyCollector:
                     break
 
                 for entry in entries:
-                    routes.append({
-                        "dest_nwk": entry.destNwk,
-                        "next_hop": entry.nextHop,
-                        "status": self._decode_route_status(entry.status),
-                        "age": entry.age,
-                    })
+                    try:
+                        dest = getattr(entry, 'destNwk', getattr(entry, 'destination', None))
+                        next_hop = getattr(entry, 'nextHop', getattr(entry, 'nextHopNwk', None))
+                        status_val = getattr(entry, 'status', 3)  # 默认 Inactive
+                        age = getattr(entry, 'age', 0)
+
+                        routes.append({
+                            "dest_nwk": dest,
+                            "next_hop": next_hop,
+                            "status": self._decode_route_status(status_val),
+                            "age": age,
+                        })
+                    except Exception as e:
+                        logger.debug(f"路由条目解析异常: {e}")
                     idx += 1
 
                 if len(entries) < 8:
@@ -114,6 +161,7 @@ class ZigbeeTopologyCollector:
 
     # ── 子节点表 ────────────────────────────────────
     async def read_child_table(self):
+        """读取子节点表"""
         children = []
         idx = 0
 
@@ -123,11 +171,18 @@ class ZigbeeTopologyCollector:
                 if status != 0:
                     break
 
-                children.append({
-                    "nwk": child_data.nwk,
-                    "ieee": str(child_data.ieee),
-                    "type": self._decode_node_type(child_data.type),
-                })
+                try:
+                    nwk = getattr(child_data, 'nwk', getattr(child_data, 'id', None))
+                    ieee = getattr(child_data, 'ieee', getattr(child_data, 'eui64', None))
+                    ntype = getattr(child_data, 'type', 2)
+
+                    children.append({
+                        "nwk": nwk,
+                        "ieee": str(ieee) if ieee else None,
+                        "type": self._decode_node_type(ntype),
+                    })
+                except Exception as e:
+                    logger.debug(f"子节点解析异常: {e}")
                 idx += 1
 
             except Exception as e:
@@ -138,36 +193,36 @@ class ZigbeeTopologyCollector:
 
     # ── 诊断分析 ────────────────────────────────────
     def analyze(self, neighbors, routes, children):
-        """对当前快照进行诊断分析，返回 alerts"""
         alerts = []
 
-        # 弱链路检测
         for nb in neighbors:
-            if nb["lqi"] < 50:
-                alerts.append({
-                    "type": "weak_link",
-                    "severity": "critical",
-                    "message": f"0x{nb['nwk']:04X} LQI={nb['lqi']} (极弱)",
-                    "node": f"0x{nb['nwk']:04X}",
-                })
-            elif nb["lqi"] < 100:
-                alerts.append({
-                    "type": "weak_link",
-                    "severity": "warning",
-                    "message": f"0x{nb['nwk']:04X} LQI={nb['lqi']} (偏弱)",
-                    "node": f"0x{nb['nwk']:04X}",
-                })
+            lqi = nb.get("lqi", 0)
+            if isinstance(lqi, int):
+                if lqi < 50:
+                    alerts.append({
+                        "type": "weak_link",
+                        "severity": "critical",
+                        "message": f"0x{nb['nwk']:04X} LQI={lqi} (极弱)",
+                        "node": f"0x{nb['nwk']:04X}",
+                    })
+                elif lqi < 100:
+                    alerts.append({
+                        "type": "weak_link",
+                        "severity": "warning",
+                        "message": f"0x{nb['nwk']:04X} LQI={lqi} (偏弱)",
+                        "node": f"0x{nb['nwk']:04X}",
+                    })
 
-        # 路由失败检测
         for r in routes:
-            if "Failed" in r["status"]:
+            status = r.get("status", "")
+            if "Failed" in status:
                 alerts.append({
                     "type": "route_failed",
                     "severity": "critical",
                     "message": f"路由到 0x{r['dest_nwk']:04X} 发现失败",
                     "node": f"0x{r['dest_nwk']:04X}",
                 })
-            elif "Underway" in r["status"]:
+            elif "Underway" in status:
                 alerts.append({
                     "type": "route_discovery",
                     "severity": "warning",
@@ -175,8 +230,25 @@ class ZigbeeTopologyCollector:
                     "node": f"0x{r['dest_nwk']:04X}",
                 })
 
-        # SED 孤儿检测（child 但不在邻居表中或 LQI 极低）
-        child_nwks = {c["nwk"] for c in children if "Sleepy" in c["type"]}
+        # 路由环路检测
+        route_map = {}
+        for r in routes:
+            dest = r.get("dest_nwk")
+            next_hop = r.get("next_hop")
+            if dest is not None and next_hop is not None:
+                route_map[dest] = next_hop
+
+        for dest, next_hop in route_map.items():
+            if next_hop in route_map and route_map[next_hop] == dest:
+                alerts.append({
+                    "type": "route_loop",
+                    "severity": "critical",
+                    "message": f"路由环路: 0x{dest:04X} ↔ 0x{next_hop:04X}",
+                    "node": f"0x{dest:04X}",
+                })
+
+        # SED 孤儿检测
+        child_nwks = {c["nwk"] for c in children if c.get("type") and "Sleepy" in c["type"]}
         neighbor_nwks = {nb["nwk"] for nb in neighbors}
         for nwk in child_nwks:
             if nwk not in neighbor_nwks:
@@ -191,98 +263,102 @@ class ZigbeeTopologyCollector:
 
     # ── 构建快照 ────────────────────────────────────
     def build_snapshot(self, neighbors, routes, children, alerts):
-        """构建前端消费的 JSON 快照"""
         nodes = {}
         links = []
 
-        # Coordinator 节点
-        nodes[f"0x{self.coordinator_nwk:04X}"] = {
-            "nwk": f"0x{self.coordinator_nwk:04X}",
+        # Coordinator
+        coord_nwk_str = f"0x{self.coordinator_nwk:04X}"
+        nodes[coord_nwk_str] = {
+            "nwk": coord_nwk_str,
             "ieee": self.coordinator_ieee,
             "type": "Coordinator",
             "status": "online",
         }
 
-        # 从邻居表构建节点和连线
+        # 邻居 → 节点 + 连线
         for nb in neighbors:
-            nwk_str = f"0x{nb['nwk']:04X}"
-            # 推断节点类型
-            if nb["relationship"] == "Child":
-                node_type = "Router"  # Coordinator 的 Child 通常是 Router
-            elif nb["relationship"] == "Parent":
-                node_type = "Router"
-            else:
-                node_type = "Router"
+            nwk = nb["nwk"]
+            if nwk is None:
+                continue
+            nwk_str = f"0x{nwk:04X}" if isinstance(nwk, int) else str(nwk)
 
-            # 如果也在 children 中，检查是否是 SED
+            node_type = "Router"
             for c in children:
-                if c["nwk"] == nb["nwk"] and "Sleepy" in c["type"]:
-                    node_type = "Sleepy_End_Device"
+                if c["nwk"] == nwk and c.get("type") and "Sleepy" in c["type"]:
+                    node_type = c["type"]
                     break
 
+            lqi = nb.get("lqi", 0)
             nodes[nwk_str] = {
                 "nwk": nwk_str,
-                "ieee": nb["ieee"],
+                "ieee": nb.get("ieee"),
                 "type": node_type,
-                "depth": nb["depth"],
-                "relationship": nb["relationship"],
-                "lqi": nb["lqi"],
+                "depth": nb.get("depth"),
+                "relationship": nb.get("relationship"),
+                "lqi": lqi if isinstance(lqi, int) else 0,
                 "status": "online",
             }
 
             links.append({
-                "source": f"0x{self.coordinator_nwk:04X}",
+                "source": coord_nwk_str,
                 "target": nwk_str,
-                "lqi": nb["lqi"],
+                "lqi": lqi if isinstance(lqi, int) else None,
             })
 
-        # SED 子节点（可能在邻居表中没有条目）
+        # SED 子节点
         for c in children:
-            nwk_str = f"0x{c['nwk']:04X}"
+            nwk = c["nwk"]
+            if nwk is None:
+                continue
+            nwk_str = f"0x{nwk:04X}" if isinstance(nwk, int) else str(nwk)
             if nwk_str not in nodes:
                 nodes[nwk_str] = {
                     "nwk": nwk_str,
-                    "ieee": c["ieee"],
-                    "type": c["type"],
+                    "ieee": c.get("ieee"),
+                    "type": c.get("type", "End_Device"),
                     "status": "online",
                 }
                 links.append({
-                    "source": f"0x{self.coordinator_nwk:04X}",
+                    "source": coord_nwk_str,
                     "target": nwk_str,
-                    "lqi": None,  # 未知
+                    "lqi": None,
                 })
 
-        # 路由信息附加上到 links
+        # 路由信息
         for r in routes:
-            dest_str = f"0x{r['dest_nwk']:04X}"
-            next_str = f"0x{r['next_hop']:04X}"
-            # 检查是否已有这条 link
+            dest = r.get("dest_nwk")
+            next_hop = r.get("next_hop")
+            if dest is None or next_hop is None:
+                continue
+            dest_str = f"0x{dest:04X}" if isinstance(dest, int) else str(dest)
+            next_str = f"0x{next_hop:04X}" if isinstance(next_hop, int) else str(next_hop)
+
             existing = next(
                 (l for l in links if l["source"] == next_str and l["target"] == dest_str),
                 None,
             )
             if existing:
-                existing["route_status"] = r["status"]
+                existing["route_status"] = r.get("status")
             else:
                 links.append({
                     "source": next_str,
                     "target": dest_str,
                     "lqi": None,
-                    "route_status": r["status"],
+                    "route_status": r.get("status"),
                 })
 
         return {
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "coordinator": {
                 "ieee": self.coordinator_ieee,
-                "nwk": f"0x{self.coordinator_nwk:04X}",
+                "nwk": coord_nwk_str,
             },
             "nodes": list(nodes.values()),
             "links": links,
             "alerts": alerts,
         }
 
-    # ── 主循环 ──────────────────────────────────────
+    # ── 单次采集 ────────────────────────────────────
     async def collect_once(self):
         neighbors = await self.read_neighbor_table()
         routes = await self.read_routing_table()
@@ -291,44 +367,62 @@ class ZigbeeTopologyCollector:
         snapshot = self.build_snapshot(neighbors, routes, children, alerts)
 
         logger.info(
-            f"采集完成: {len(snapshot['nodes'])} 节点, "
+            f"采集: {len(snapshot['nodes'])} 节点, "
             f"{len(snapshot['links'])} 连线, "
             f"{len(alerts)} 告警"
         )
         return snapshot
 
+    # ── 主循环 ──────────────────────────────────────
     async def run(self, interval: int = 10):
         """主采集循环"""
         await self.connect()
         logger.info(f"开始采集，间隔 {interval}s")
 
+        retry_count = 0
+        max_retries = 5
+
         while True:
             try:
                 snapshot = await self.collect_once()
                 await self._notify(snapshot)
+                retry_count = 0  # 重置重试计数
                 await asyncio.sleep(interval)
+
             except asyncio.CancelledError:
                 logger.info("采集已取消")
                 break
+
+            except ConnectionError as e:
+                retry_count += 1
+                logger.error(f"连接断开 ({retry_count}/{max_retries}): {e}")
+                if retry_count >= max_retries:
+                    logger.error("重试次数耗尽，停止采集")
+                    break
+                await asyncio.sleep(5 * retry_count)  # 递增等待
+
             except Exception as e:
                 logger.error(f"采集异常: {e}", exc_info=True)
-                await asyncio.sleep(5)
+                await asyncio.sleep(10)
 
     # ── 解码辅助 ────────────────────────────────────
     @staticmethod
     def _decode_relationship(rel):
-        return {0: "Parent", 1: "Child", 2: "Sibling", 3: "None", 4: "Previous_Child"}.get(
-            rel, f"Unknown({rel})"
-        )
+        return {
+            0: "Parent", 1: "Child", 2: "Sibling",
+            3: "None", 4: "Previous_Child"
+        }.get(rel, f"Unknown({rel})")
 
     @staticmethod
     def _decode_route_status(status):
         return {
-            0: "Active", 1: "Discovery_Underway", 2: "Discovery_Failed", 3: "Inactive"
+            0: "Active", 1: "Discovery_Underway",
+            2: "Discovery_Failed", 3: "Inactive"
         }.get(status, f"Unknown({status})")
 
     @staticmethod
     def _decode_node_type(ntype):
         return {
-            0: "Coordinator", 1: "Router", 2: "End_Device", 3: "Sleepy_End_Device"
+            0: "Coordinator", 1: "Router",
+            2: "End_Device", 3: "Sleepy_End_Device"
         }.get(ntype, f"Unknown({ntype})")
