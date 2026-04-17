@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zigbee 网络拓扑分析</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div id="app">
+        <!-- 顶部工具栏 -->
+        <header class="toolbar">
+            <h1>🏗️ Zigbee 网络拓扑</h1>
+            <div class="toolbar-actions">
+                <div class="status-indicator" id="status">
+                    <span class="dot"></span>
+                    <span class="text">未连接</span>
+                </div>
+                <button id="btn-connect" onclick="connectCoordinator()">连接 Coordinator</button>
+                <button id="btn-disconnect" onclick="disconnectCoordinator()" disabled>断开</button>
+                <select id="port-select">
+                    <option value="/dev/ttyUSB0">/dev/ttyUSB0</option>
+                    <option value="/dev/ttyACM0">/dev/ttyACM0</option>
+                    <option value="COM3">COM3</option>
+                </select>
+                <button onclick="refreshSnapshot()">🔄 刷新</button>
+            </div>
+        </header>
+
+        <!-- 主体 -->
+        <div class="main-content">
+            <!-- 左侧：拓扑图 -->
+            <div class="topology-panel">
+                <div class="panel-header">
+                    <span>拓扑视图</span>
+                    <div class="legend">
+                        <span class="legend-item"><span class="dot coord"></span>Coordinator</span>
+                        <span class="legend-item"><span class="dot router"></span>Router</span>
+                        <span class="legend-item"><span class="dot sed"></span>SED</span>
+                        <span class="legend-item"><span class="dot alert"></span>异常</span>
+                    </div>
+                </div>
+                <svg id="topology-svg"></svg>
+            </div>
+
+            <!-- 右侧：信息面板 -->
+            <div class="info-panel">
+                <!-- 统计摘要 -->
+                <div class="card" id="summary-card">
+                    <h3>📊 网络摘要</h3>
+                    <div class="stats">
+                        <div class="stat">
+                            <span class="stat-value" id="stat-nodes">0</span>
+                            <span class="stat-label">节点</span>
+                        </div>
+                        <div class="stat">
+                            <span class="stat-value" id="stat-links">0</span>
+                            <span class="stat-label">连线</span>
+                        </div>
+                        <div class="stat">
+                            <span class="stat-value" id="stat-alerts">0</span>
+                            <span class="stat-label">告警</span>
+                        </div>
+                        <div class="stat">
+                            <span class="stat-value" id="stat-routers">0</span>
+                            <span class="stat-label">Router</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 告警列表 -->
+                <div class="card" id="alerts-card">
+                    <h3>⚠️ 告警</h3>
+                    <div id="alerts-list" class="alert-list">
+                        <p class="empty">暂无告警</p>
+                    </div>
+                </div>
+
+                <!-- 节点详情 -->
+                <div class="card" id="node-detail-card" style="display:none">
+                    <h3>📌 节点详情</h3>
+                    <div id="node-detail"></div>
+                </div>
+
+                <!-- LQI 链路详情 -->
+                <div class="card" id="link-detail-card" style="display:none">
+                    <h3>🔗 链路详情</h3>
+                    <div id="link-detail"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="src/d3.v7.min.js"></script>
+    <script src="src/topology.js"></script>
+</body>
+</html>
